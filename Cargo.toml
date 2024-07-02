@@ -1,0 +1,17 @@
+[package]
+name = "youtube-info-crawler"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+chrono = "0.4.38"
+fantoccini = "0.19.3"
+futures = "0.3.30"
+futures-util = "0.3.30"
+rayon = "1.10.0"
+reqwest = "0.11"
+rustube = "0.6.0"
+serde_json = "1.0.119"
+tokio = { version = "1.38.0", features = ["full"] }
+youtube-captions = { version = "0.1.0", features = ["json3", "srv1", "srv2", "srv3"] }
