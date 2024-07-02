@@ -1,12 +1,15 @@
 #![feature(async_closure)]
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Duration,
+};
 
 use anyhow::Result;
+use chromiumoxide::{browser::Browser, BrowserConfig, Element, Page};
 use chrono::Utc;
-use fantoccini::{Client, ClientBuilder, Locator};
 use futures::{stream::FuturesUnordered, StreamExt};
 use rustube::{Id, VideoFetcher};
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::{fs, io::AsyncWriteExt, sync::OnceCell, time::sleep};
 use youtube_captions::{language_tags::LanguageTag, DigestScraper};
 
 #[derive(Debug)]
@@ -17,56 +20,72 @@ struct Metrics {
     average_sentence_length: f64,
 }
 
-async fn init_browser() -> Result<Client> {
-    let client = ClientBuilder::native()
-        .capabilities(
-            serde_json::from_str(
-                r#"{"browserName":"chrome","goog:chromeOptions":{"args":["--headless"]}}"#,
-            )
-            .unwrap(),
-        )
-        .connect("http://localhost:9515")
-        .await?;
+static mut BROWSER: OnceCell<Browser> = OnceCell::const_new();
 
-    Ok(client)
+async fn init_browser() -> Result<Browser> {
+    let (browser, mut handler) = Browser::launch(BrowserConfig::builder().build().unwrap())
+        .await
+        .unwrap();
+
+    tokio::task::spawn(async move {
+        while let Some(h) = handler.next().await {
+            if h.is_err() {
+                break;
+            }
+        }
+    });
+
+    Ok(browser)
+}
+
+async fn wait_for_element(selector: &str, page: &Page) -> Element {
+    loop {
+        if let Ok(element) = page.find_element(selector).await {
+            return element;
+        }
+        sleep(Duration::from_secs(1)).await
+    }
+}
+
+async fn wait_for_elements(selector: &str, page: &Page) -> Vec<Element> {
+    loop {
+        if let Ok(elements) = page.find_elements(selector).await {
+            return elements
+        }
+        sleep(Duration::from_secs(1)).await
+    }
 }
 
 async fn get_channel_information(channel_url: &str) -> Result<(String, (String, Vec<String>))> {
-    let client = init_browser().await?;
+    let browser = unsafe { BROWSER.get_or_try_init(init_browser).await? };
 
     let videos_url = format!("{}/videos", channel_url);
 
-    client.goto(&videos_url).await?;
+    let page = browser.new_page(&videos_url).await?;
 
-    let channel_description_show_more_link_selector =
-        Locator::Css("yt-description-preview-view-model");
-    client
-        .wait()
-        .for_element(channel_description_show_more_link_selector)
-        .await?
+    wait_for_element("yt-description-preview-view-model", &page)
+        .await
         .click()
         .await?;
 
-    let channel_description_selector = Locator::Css("#description-container > span:nth-child(1)");
-    let description = client
-        .wait()
-        .for_element(channel_description_selector)
+    let description = wait_for_element("#description-container > span:nth-child(1)", &page)
+        .await
+        .inner_text()
         .await?
-        .text()
-        .await?;
+        .unwrap();
 
-    let video_link_selector = Locator::Css("ytd-rich-item-renderer > div:nth-child(1) > ytd-rich-grid-media:nth-child(1) > div:nth-child(1) > div:nth-child(3) > div:nth-child(2) > h3:nth-child(1) > a:nth-child(2)");
-    client.wait().for_element(video_link_selector).await?;
-    let video_elements = client.find_all(video_link_selector).await?;
+    let video_elements = wait_for_elements("ytd-rich-item-renderer > div:nth-child(1) > ytd-rich-grid-media:nth-child(1) > div:nth-child(1) > div:nth-child(3) > div:nth-child(2) > h3:nth-child(1) > a:nth-child(2)", &page).await;
     let recent_videos_ids = video_elements
         .into_iter()
-        .map(|element| async move { element.attr("href").await.unwrap().unwrap() })
+        .map(|element| async move { element.attribute("href").await.unwrap().unwrap() })
         .collect::<FuturesUnordered<_>>()
         .map(|relative_link| format!("https://www.youtube.com/{relative_link}"))
         .map(|link| link.split_once('=').unwrap().1.to_string())
         .collect::<Vec<_>>()
         .await;
-    eprintln!("{}: finished getting video ids", channel_url);
+    println!("{}: finished getting video ids", channel_url);
+
+    let _ = page.close().await;
 
     Ok((channel_url.to_string(), (description, recent_videos_ids)))
 }
@@ -124,37 +143,36 @@ async fn get_sentence_metrics(recent_videos_ids: Vec<String>) -> (f64, f64) {
 }
 
 async fn get_channels_metrics(channels_url: HashSet<&str>) -> HashMap<String, Metrics> {
-    let partial_channels_metrics = channels_url
+    channels_url
         .iter()
-        .map(|channel_url| async move { get_channel_information(channel_url).await })
-        .collect::<FuturesUnordered<_>>()
-        .filter_map(|info| async move { info.ok() });
+        .map(|channel_url| async move {
+            let (channel_url, (description, recent_videos_ids)) =
+                match get_channel_information(channel_url).await {
+                    Ok(value) => value,
+                    Err(_) => return None,
+                };
 
-    partial_channels_metrics
-        .map(
-            |(channel_url, (description, recent_videos_ids)): (
-                String,
-                (String, Vec<String>),
-            )| async move {
-                println!("{channel_url}: start getting metrics");
-                let average_duration = get_video_metrics(recent_videos_ids.clone()).await;
-                let (average_sentence_duration, average_sentence_length) =
-                    get_sentence_metrics(recent_videos_ids).await;
-                println!("{channel_url}: finish getting metrics");
-                (
-                    channel_url,
-                    Metrics {
-                        description,
-                        average_duration,
-                        average_sentence_duration,
-                        average_sentence_length,
-                    },
-                )
-            },
-        )
+            println!("{channel_url}: start getting metrics");
+            let average_duration = get_video_metrics(recent_videos_ids.clone()).await;
+            let (average_sentence_duration, average_sentence_length) =
+                get_sentence_metrics(recent_videos_ids).await;
+            println!("{channel_url}: finish getting metrics");
+
+            let data = (
+                channel_url,
+                Metrics {
+                    description,
+                    average_duration,
+                    average_sentence_duration,
+                    average_sentence_length,
+                },
+            );
+
+            Some(data)
+        })
         .collect::<FuturesUnordered<_>>()
-        .await
-        .collect::<HashMap<_, _>>()
+        .filter_map(|data| async move { data })
+        .collect()
         .await
 }
 
@@ -209,6 +227,10 @@ async fn main() -> Result<()> {
     }
 
     println!("Finished");
+
+    unsafe {
+        BROWSER.get_mut().unwrap().close().await.unwrap();
+    }
 
     Ok(())
 }
