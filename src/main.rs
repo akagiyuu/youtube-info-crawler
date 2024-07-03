@@ -9,11 +9,14 @@ use chromiumoxide::{browser::Browser, BrowserConfig, Element, Page};
 use chrono::Utc;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rustube::{Id, VideoFetcher};
-use tokio::{fs, io::AsyncWriteExt, sync::OnceCell, time::sleep};
+use serde::Serialize;
+use tokio::{sync::OnceCell, time::sleep};
 use youtube_captions::{language_tags::LanguageTag, DigestScraper};
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "PascalCase")]
 struct Metrics {
+    url: String,
     description: String,
     average_duration: f64,
     average_sentence_duration: f64,
@@ -50,7 +53,7 @@ async fn wait_for_element(selector: &str, page: &Page) -> Element {
 async fn wait_for_elements(selector: &str, page: &Page) -> Vec<Element> {
     loop {
         if let Ok(elements) = page.find_elements(selector).await {
-            return elements
+            return elements;
         }
         sleep(Duration::from_secs(1)).await
     }
@@ -159,8 +162,9 @@ async fn get_channels_metrics(channels_url: HashSet<&str>) -> HashMap<String, Me
             println!("{channel_url}: finish getting metrics");
 
             let data = (
-                channel_url,
+                channel_url.clone(),
                 Metrics {
+                    url: channel_url,
                     description,
                     average_duration,
                     average_sentence_duration,
@@ -178,8 +182,7 @@ async fn get_channels_metrics(channels_url: HashSet<&str>) -> HashMap<String, Me
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut channels_url = HashSet::from_iter([
-    ]);
+    let mut channels_url = HashSet::from_iter([]);
 
     let data_file_name = format!("data_{}.csv", Utc::now());
 
@@ -196,23 +199,15 @@ async fn main() -> Result<()> {
         }
 
         let metrics_map = get_channels_metrics(channels_url.clone()).await;
-        let mut file = fs::OpenOptions::new()
+        let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
-            .open(&data_file_name)
-            .await?;
+            .open(&data_file_name)?;
+
+        let mut csv_writer = csv::Writer::from_writer(file);
 
         for (url, metrics) in metrics_map {
-            let content = format!(
-                "\"{}\",{},{},{},\"{}\"\n",
-                url,
-                metrics.average_sentence_duration,
-                metrics.average_sentence_length,
-                metrics.average_duration,
-                metrics.description.replace('\n', "\\n"),
-            );
-
-            file.write_all(content.as_bytes()).await?;
+            csv_writer.serialize(metrics)?;
 
             channels_url.remove(url.as_str());
         }
