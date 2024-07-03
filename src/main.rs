@@ -1,6 +1,8 @@
 #![feature(async_closure)]
 use std::{
     collections::{HashMap, HashSet},
+    fs,
+    path::Path,
     time::Duration,
 };
 
@@ -9,9 +11,15 @@ use chromiumoxide::{browser::Browser, BrowserConfig, Element, Page};
 use chrono::Utc;
 use futures::{stream::FuturesUnordered, StreamExt};
 use rustube::{Id, VideoFetcher};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::{sync::OnceCell, time::sleep};
 use youtube_captions::{language_tags::LanguageTag, DigestScraper};
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct InputRecord {
+    url: String,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "PascalCase")]
@@ -145,7 +153,7 @@ async fn get_sentence_metrics(recent_videos_ids: Vec<String>) -> (f64, f64) {
     (average_sentence_duration, average_sentence_length)
 }
 
-async fn get_channels_metrics(channels_url: HashSet<&str>) -> HashMap<String, Metrics> {
+async fn get_channels_metrics(channels_url: HashSet<String>) -> HashMap<String, Metrics> {
     channels_url
         .iter()
         .map(|channel_url| async move {
@@ -180,13 +188,41 @@ async fn get_channels_metrics(channels_url: HashSet<&str>) -> HashMap<String, Me
         .await
 }
 
+fn read_input(path: impl AsRef<Path>) -> Result<HashSet<String>> {
+    let input_file = fs::OpenOptions::new().read(true).open(path)?;
+    let mut csv_reader = csv::Reader::from_reader(input_file);
+
+    csv_reader
+        .deserialize::<InputRecord>()
+        .map(|record| match record {
+            Ok(record) => Ok(record.url),
+            Err(error) => Err(anyhow::Error::from(error)),
+        })
+        .collect::<Result<HashSet<_>>>()
+}
+
+fn write_data<'a, I: Iterator<Item = &'a Metrics>>(
+    metrics_iter: I,
+    path: impl AsRef<Path>,
+) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+
+    let mut csv_writer = csv::Writer::from_writer(file);
+
+    metrics_iter
+        .map(|metrics| csv_writer.serialize(metrics))
+        .try_for_each(|result| result.map_err(anyhow::Error::from))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut channels_url = HashSet::from_iter([]);
+    let mut channels_url = read_input("input.csv")?;
 
     let data_file_name = format!("data_{}.csv", Utc::now());
 
-    let mut pre_length = channels_url.len();
     let mut try_count = 0;
 
     while !channels_url.is_empty() {
@@ -199,26 +235,17 @@ async fn main() -> Result<()> {
         }
 
         let metrics_map = get_channels_metrics(channels_url.clone()).await;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&data_file_name)?;
 
-        let mut csv_writer = csv::Writer::from_writer(file);
+        write_data(metrics_map.values(), &data_file_name)?;
 
-        for (url, metrics) in metrics_map {
-            csv_writer.serialize(metrics)?;
+        let mut is_removed = false;
 
+        for url in metrics_map.keys() {
             channels_url.remove(url.as_str());
+            is_removed = true;
         }
 
-        if channels_url.len() == pre_length {
-            try_count += 1;
-        } else {
-            try_count = 0;
-        }
-
-        pre_length = channels_url.len();
+        try_count = if is_removed { 0 } else { try_count + 1 };
     }
 
     println!("Finished");
