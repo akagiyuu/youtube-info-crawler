@@ -1,16 +1,27 @@
 #![feature(async_closure)]
-pub mod data_processor;
 pub mod browser;
+pub mod data_processor;
 
-use std::{
-    collections::HashSet,
-    fs,
-    path::Path,
-};
+use std::{collections::HashSet, fs, path::Path};
 
 use anyhow::Result;
 use chrono::Utc;
+use clap::Parser;
+use data_processor::Metrics;
+use futures::{stream::FuturesUnordered, StreamExt};
 use serde::{Deserialize, Serialize};
+
+#[derive(Parser, Debug)]
+struct Args {
+    #[arg(short, long)]
+    input: String,
+
+    #[arg(short, long)]
+    output_dir: String,
+
+    #[arg(short, long, default_value_t = 3)]
+    retry: usize,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -18,15 +29,6 @@ struct InputRecord {
     url: String,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "PascalCase")]
-pub struct Metrics {
-    url: String,
-    description: String,
-    average_duration: f64,
-    average_sentence_duration: f64,
-    average_sentence_length: f64,
-}
 fn read_input(path: impl AsRef<Path>) -> Result<HashSet<String>> {
     let input_file = fs::OpenOptions::new().read(true).open(path)?;
     let mut csv_reader = csv::Reader::from_reader(input_file);
@@ -58,9 +60,13 @@ fn write_data<'a, I: Iterator<Item = &'a Metrics>>(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut channels_url = read_input("input.csv")?;
+    let args = Args::parse();
 
-    let data_file_name = format!("data_{}.csv", Utc::now());
+    let mut channels_url = read_input(args.input)?;
+
+    fs::create_dir_all(&args.output_dir)?;
+
+    let data_path = format!("{}/metrics.csv", args.output_dir);
 
     let mut try_count = 0;
 
@@ -68,19 +74,33 @@ async fn main() -> Result<()> {
         println!("Reamining channel count: {}", channels_url.len());
         println!("Remaining channels {:#?}", channels_url);
 
-        if try_count >= 3 {
+        if try_count >= args.retry {
             println!("Failed after retry");
             break;
         }
 
-        let metrics_map = data_processor::get_channels_metrics(channels_url.clone()).await;
+        let metrics_list = channels_url
+            .iter()
+            .map(|url| async move {
+                let mut metrics = Metrics::new(url.clone());
 
-        write_data(metrics_map.values(), &data_file_name)?;
+                metrics.fetch_description_and_video_ids().await?;
+                metrics.fetch_video_metrics().await?;
+                metrics.fetch_sentence_metrics().await?;
+
+                Ok(metrics)
+            })
+            .collect::<FuturesUnordered<_>>()
+            .filter_map(|metrics: Result<Metrics>| async move { metrics.ok() })
+            .collect::<Vec<_>>()
+            .await;
+
+        write_data(metrics_list.iter(), &data_path)?;
 
         let mut is_removed = false;
 
-        for url in metrics_map.keys() {
-            channels_url.remove(url.as_str());
+        for metrics in metrics_list.iter() {
+            channels_url.remove(&metrics.url);
             is_removed = true;
         }
 
