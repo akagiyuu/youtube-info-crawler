@@ -101,7 +101,6 @@ async fn main() -> Result<()> {
                     metrics.fetch_sentence_metrics().await?;
 
                     if args.download {
-                        eprintln!("DEBUGPRINT[1]: main.rs:103 (after if args.download )");
                         metrics
                             .download(PathBuf::from(output_dir), args.number_of_videos_to_download)
                             .await.unwrap();

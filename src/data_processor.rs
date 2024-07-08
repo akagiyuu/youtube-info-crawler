@@ -187,8 +187,6 @@ impl Metrics {
             .collect::<FuturesUnordered<_>>()
             .collect::<Vec<Result<_>>>()
             .await;
-
-        eprintln!("DEBUGPRINT[2]: data_processor.rs:184 (after .await;)");
         Ok(())
     }
 }
