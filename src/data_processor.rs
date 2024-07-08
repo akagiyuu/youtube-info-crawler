@@ -1,8 +1,13 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::PathBuf,
+    sync::Arc,
+};
 
 use anyhow::Result;
 use futures::{stream::FuturesUnordered, StreamExt};
-use rustube::{Id, VideoFetcher};
+use rustube::{Id, Video, VideoFetcher};
 use serde::Serialize;
 use youtube_captions::{language_tags::LanguageTag, DigestScraper};
 
@@ -128,6 +133,60 @@ impl Metrics {
         self.average_sentence_duration =
             Some(total_sentence_duration as f64 / sentence_count as f64);
         self.average_sentence_length = Some(total_sentence_length as f64 / sentence_count as f64);
+        Ok(())
+    }
+
+    pub async fn download(
+        &self,
+        output_dir: PathBuf,
+        number_of_videos_to_download: u8,
+    ) -> Result<()> {
+        let recent_videos_ids = self.recent_videos_ids.clone().ok_or(anyhow::anyhow!(
+            "Call fetch_description_and_video_ids first",
+        ))?;
+
+        let mut current_channel_out_dir = output_dir;
+        current_channel_out_dir.push(&self.url);
+        fs::create_dir_all(&current_channel_out_dir)?;
+
+        recent_videos_ids
+            .into_iter()
+            .take(number_of_videos_to_download as usize)
+            .map(|id| Id::from_string(id).unwrap())
+            .map(|id| {
+                let current_channel_out_dir = current_channel_out_dir.clone();
+                async move {
+                    println!("{}: downloading video", current_channel_out_dir.file_name().unwrap().to_str().unwrap());
+                    let video_path = Video::from_id(id.clone())
+                        .await
+                        .unwrap()
+                        .best_quality()
+                        .unwrap()
+                        .download_to_dir(&current_channel_out_dir)
+                        .await?;
+
+                    println!("{}: run ASD", current_channel_out_dir.file_name().unwrap().to_str().unwrap());
+                    tokio::process::Command::new("python")
+                        .current_dir("Light-ASD")
+                        .args([
+                            "Columbia_test.py",
+                            "--videoName",
+                            video_path.file_name().unwrap().to_str().unwrap(),
+                            "--videoFolder",
+                            current_channel_out_dir.to_str().unwrap(),
+                        ])
+                        .spawn()?
+                        .wait()
+                        .await?;
+
+                    println!("{}: finished processing", current_channel_out_dir.file_name().unwrap().to_str().unwrap());
+
+                    Ok(())
+                }
+            })
+            .collect::<FuturesUnordered<_>>()
+            .collect::<Vec<Result<_>>>()
+            .await;
         Ok(())
     }
 }

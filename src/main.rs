@@ -2,7 +2,11 @@
 pub mod browser;
 pub mod data_processor;
 
-use std::{collections::HashSet, fs, path::Path};
+use std::{
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+};
 
 use anyhow::Result;
 use chrono::Utc;
@@ -21,6 +25,12 @@ struct Args {
 
     #[arg(short, long, default_value_t = 3)]
     retry: usize,
+
+    #[arg(short, long, default_value_t = false)]
+    download: bool,
+
+    #[arg(short, long, default_value_t = 5, requires("download"))]
+    number_of_videos_to_download: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -81,14 +91,23 @@ async fn main() -> Result<()> {
 
         let metrics_list = channels_url
             .iter()
-            .map(|url| async move {
-                let mut metrics = Metrics::new(url.clone());
+            .map(|url| {
+                let output_dir = args.output_dir.clone();
+                async move {
+                    let mut metrics = Metrics::new(url.clone());
 
-                metrics.fetch_description_and_video_ids().await?;
-                metrics.fetch_video_metrics().await?;
-                metrics.fetch_sentence_metrics().await?;
+                    metrics.fetch_description_and_video_ids().await?;
+                    metrics.fetch_video_metrics().await?;
+                    metrics.fetch_sentence_metrics().await?;
 
-                Ok(metrics)
+                    if args.download {
+                        metrics
+                            .download(PathBuf::from(output_dir), args.number_of_videos_to_download)
+                            .await.unwrap();
+                    }
+
+                    Ok(metrics)
+                }
             })
             .collect::<FuturesUnordered<_>>()
             .filter_map(|metrics: Result<Metrics>| async move { metrics.ok() })
