@@ -1,5 +1,4 @@
 #![feature(async_closure)]
-pub mod browser;
 pub mod data_processor;
 
 use std::{
@@ -9,11 +8,10 @@ use std::{
 };
 
 use anyhow::Result;
-use chrono::Utc;
 use clap::Parser;
 use data_processor::Metrics;
 use futures::{stream::FuturesUnordered, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -28,9 +26,6 @@ struct Args {
 
     #[arg(short, long, default_value_t = false)]
     download: bool,
-
-    #[arg(short, long, default_value_t = 5, requires("download"))]
-    number_of_videos_to_download: u8,
 }
 
 #[derive(Debug, Deserialize)]
@@ -96,14 +91,12 @@ async fn main() -> Result<()> {
                 async move {
                     let mut metrics = Metrics::new(url.clone());
 
-                    metrics.fetch_description_and_video_ids().await?;
+                    metrics.fetch_channel_infos().await?;
                     metrics.fetch_video_metrics().await?;
                     metrics.fetch_sentence_metrics().await?;
 
                     if args.download {
-                        metrics
-                            .download(PathBuf::from(output_dir), args.number_of_videos_to_download)
-                            .await.unwrap();
+                        metrics.download(PathBuf::from(output_dir)).await.unwrap();
                     }
 
                     Ok(metrics)
@@ -127,10 +120,6 @@ async fn main() -> Result<()> {
     }
 
     println!("Finished");
-
-    unsafe {
-        browser::close().await?;
-    }
 
     Ok(())
 }
