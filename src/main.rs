@@ -5,6 +5,7 @@ use std::{
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use anyhow::Result;
@@ -12,6 +13,9 @@ use clap::Parser;
 use data_processor::Metrics;
 use futures::{stream::FuturesUnordered, StreamExt};
 use serde::Deserialize;
+use tokio::sync::Mutex;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -26,12 +30,14 @@ struct Args {
 
     #[arg(short, long, default_value_t = false)]
     download: bool,
+
+    #[arg(short, long, default_value_t = 10)]
+    limit: u64,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "PascalCase")]
 struct InputRecord {
-    url: String,
+    link: String,
 }
 
 fn read_input(path: impl AsRef<Path>) -> Result<HashSet<String>> {
@@ -41,85 +47,88 @@ fn read_input(path: impl AsRef<Path>) -> Result<HashSet<String>> {
     csv_reader
         .deserialize::<InputRecord>()
         .map(|record| match record {
-            Ok(record) => Ok(record.url),
+            Ok(record) => Ok(record.link),
             Err(error) => Err(anyhow::Error::from(error)),
         })
         .collect::<Result<HashSet<_>>>()
 }
 
-fn write_data<'a, I: Iterator<Item = &'a Metrics>>(
-    metrics_iter: I,
-    path: impl AsRef<Path>,
-) -> Result<()> {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-
-    let mut csv_writer = csv::Writer::from_writer(file);
-
-    metrics_iter
-        .map(|metrics| csv_writer.serialize(metrics))
-        .try_for_each(|result| result.map_err(anyhow::Error::from))
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().pretty())
+        .with(LevelFilter::INFO)
+        .init();
+
     let args = Args::parse();
 
-    let mut channels_url = read_input(args.input)?;
+    let channels_url = Arc::new(Mutex::new(read_input(args.input)?));
 
     fs::create_dir_all(&args.output_dir)?;
 
-    let data_path = format!("{}/metrics.csv", args.output_dir);
+    let metrics_path = format!("{}/metrics.csv", args.output_dir);
 
     let mut try_count = 0;
+    let mut pre_length = channels_url.lock().await.len();
 
-    while !channels_url.is_empty() {
-        println!("Reamining channel count: {}", channels_url.len());
-        println!("Remaining channels {:#?}", channels_url);
+    while pre_length > 0 {
+        tracing::info!("Reamining channel count: {}", pre_length);
+        tracing::info!("Remaining channels {:#?}", channels_url.lock().await);
 
         if try_count >= args.retry {
-            println!("Failed after retry");
+            tracing::info!("Failed after retry");
             break;
         }
 
-        let metrics_list = channels_url
-            .iter()
+        let urls = channels_url.lock().await.clone();
+        urls.into_iter()
+            .take(args.limit as usize)
             .map(|url| {
                 let output_dir = args.output_dir.clone();
+                let metrics_path = metrics_path.clone();
+                let channels_url = channels_url.clone();
                 async move {
-                    let mut metrics = Metrics::new(url.clone());
-
-                    metrics.fetch_channel_infos().await?;
-                    metrics.fetch_video_metrics().await?;
-                    metrics.fetch_sentence_metrics().await?;
+                    let metrics = Metrics::new(url.clone()).await?;
 
                     if args.download {
                         metrics.download(PathBuf::from(output_dir)).await.unwrap();
                     }
 
-                    Ok(metrics)
+                    tracing::info!("{}: start writing data", &metrics.link);
+
+                    let metrics_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(metrics_path)?;
+                    let mut metrics_writer = csv::WriterBuilder::new()
+                        .has_headers(false)
+                        .from_writer(metrics_file);
+
+                    metrics_writer.serialize(&metrics)?;
+
+                    metrics_writer.flush()?;
+
+                    channels_url.lock().await.remove(&metrics.link);
+
+                    tracing::info!("{}: finished writing data", &metrics.link);
+
+                    Ok(())
                 }
             })
             .collect::<FuturesUnordered<_>>()
-            .filter_map(|metrics: Result<Metrics>| async move { metrics.ok() })
-            .collect::<Vec<_>>()
+            .collect::<Vec<Result<_>>>()
             .await;
 
-        write_data(metrics_list.iter(), &data_path)?;
-
-        let mut is_removed = false;
-
-        for metrics in metrics_list.iter() {
-            channels_url.remove(&metrics.url);
-            is_removed = true;
-        }
-
-        try_count = if is_removed { 0 } else { try_count + 1 };
+        let current_length = channels_url.lock().await.len();
+        try_count = if current_length == pre_length {
+            try_count + 1
+        } else {
+            0
+        };
+        pre_length = current_length;
     }
 
-    println!("Finished");
+    tracing::info!("Finished");
 
     Ok(())
 }
