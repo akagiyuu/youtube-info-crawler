@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
                 async move {
                     let metrics = Metrics::new(url.clone()).await?;
 
-                    tracing::info!("{}: start writing data", &metrics.channel_metrics.link);
+                    tracing::info!("{}: start writing data", &metrics.link);
 
                     let metrics_file = std::fs::OpenOptions::new()
                         .create(true)
@@ -100,11 +100,11 @@ async fn main() -> Result<()> {
                         .has_headers(false)
                         .from_writer(metrics_file);
 
-                    metrics_writer.serialize(&metrics)?;
+                    metrics_writer.serialize(&metrics).unwrap();
 
                     metrics_writer.flush()?;
 
-                    tracing::info!("{}: finished writing data", &metrics.channel_metrics.link);
+                    tracing::info!("{}: finished writing data", &metrics.link);
 
                     if args.is_download {
                         metrics.download(PathBuf::from(output_dir)).await.unwrap();

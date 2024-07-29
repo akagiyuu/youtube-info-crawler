@@ -44,7 +44,7 @@ fn get_subtitles(video: &SingleVideo) -> Option<Vec<Subtitle>> {
     }
 }
 
-#[derive(Default, Add)]
+#[derive(Debug, Default, Add)]
 struct PartialVideoListMetrics {
     video_count: usize,
     total_duration: f64,
@@ -57,6 +57,10 @@ impl PartialVideoListMetrics {
     #[tracing::instrument(err)]
     async fn new(link: String, start: usize, end: usize) -> Result<Self> {
         let data = fetch_videos_data(&link, start, end).await?;
+
+        if data.is_empty() {
+            return Ok(PartialVideoListMetrics::default());
+        }
 
         let subtitle_links = data
             .par_iter()
@@ -152,6 +156,8 @@ impl VideoListMetrics {
                 acc + x
             })
             .await;
+
+        tracing::debug!("{:?}", video_list_metrics_raw);
 
         video_list_metrics_raw.into()
     }
