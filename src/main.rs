@@ -1,5 +1,5 @@
 #![feature(async_closure)]
-pub mod data_processor;
+pub mod metrics;
 
 use std::{
     collections::HashSet,
@@ -10,8 +10,8 @@ use std::{
 
 use anyhow::Result;
 use clap::Parser;
-use data_processor::Metrics;
 use futures::{stream::FuturesUnordered, StreamExt};
+use metrics::Metrics;
 use serde::Deserialize;
 use tokio::sync::Mutex;
 use tracing::level_filters::LevelFilter;
@@ -28,8 +28,8 @@ struct Args {
     #[arg(short, long, default_value_t = 3)]
     retry: usize,
 
-    #[arg(short, long, default_value_t = false)]
-    download: bool,
+    #[arg(long, default_value_t = false)]
+    is_download: bool,
 
     #[arg(short, long, default_value_t = 10)]
     limit: u64,
@@ -90,11 +90,7 @@ async fn main() -> Result<()> {
                 async move {
                     let metrics = Metrics::new(url.clone()).await?;
 
-                    if args.download {
-                        metrics.download(PathBuf::from(output_dir)).await.unwrap();
-                    }
-
-                    tracing::info!("{}: start writing data", &metrics.link);
+                    tracing::info!("{}: start writing data", &metrics.channel_metrics.link);
 
                     let metrics_file = std::fs::OpenOptions::new()
                         .create(true)
@@ -108,9 +104,13 @@ async fn main() -> Result<()> {
 
                     metrics_writer.flush()?;
 
-                    channels_url.lock().await.remove(&metrics.link);
+                    tracing::info!("{}: finished writing data", &metrics.channel_metrics.link);
 
-                    tracing::info!("{}: finished writing data", &metrics.link);
+                    if args.is_download {
+                        metrics.download(PathBuf::from(output_dir)).await.unwrap();
+                    }
+
+                    channels_url.lock().await.remove(&url);
 
                     Ok(())
                 }
